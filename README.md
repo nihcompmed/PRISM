@@ -180,6 +180,9 @@ survey-semantics analyze-file responses.csv \
 ### Optional refinements
 
 - **`--pan-mild`** — also flag below-ceiling outliers (adds `At_Ceiling`, `Is_Pan_Mild_Emp<pct>`).
+- **Progress** — `analyze-file` prints per-stage progress to **stderr** by default
+  (loading, imputing, stability sweep with a live `k/N` counter, scoring, UMAP); add
+  **`--quiet`** to silence it. `--skip-umap` removes the slowest step when you don't need plots.
 
 (The dimension rule, `--d-selection`, is part of stage 3 above — `variance`
 default, plus `eigengap` / `parallel` / `stability` / `max`.)

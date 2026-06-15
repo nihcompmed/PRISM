@@ -1,7 +1,7 @@
 """Core semantic survey analysis pipeline."""
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -273,6 +273,7 @@ def analyze_survey_table(
     item_columns: Optional[Sequence[str]] = None,
     item_embeddings: Optional[ItemEmbeddings] = None,
     basis: Optional[SemanticBasis] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> AnalysisResult:
     """Run semantic manifold analysis for one survey table.
 
@@ -286,6 +287,8 @@ def analyze_survey_table(
     """
 
     config = config or AnalysisConfig()
+    # Optional per-stage progress reporting (no-op unless a callback is passed).
+    log = progress if progress is not None else (lambda _msg: None)
     # Network/offline guards are only needed when we actually load the model.
     if config.disable_network and item_embeddings is None and basis is None:
         enforce_local_ai_offline_policy()
@@ -355,6 +358,7 @@ def analyze_survey_table(
                 len(responses_raw), config.min_rows
             )
         )
+    log("loaded {} subjects x {} items".format(len(responses_raw), len(item_columns)))
 
     # Survey weights (optional): row-aligned to the raw table, subset to the kept
     # subjects, then guarded like the NHIS script (non-finite/<=0 -> median).
@@ -375,6 +379,8 @@ def analyze_survey_table(
             weights = weights.copy()
             weights[~valid] = float(np.median(weights[valid]))
 
+    if responses_raw.isna().any().any():
+        log("imputing missing values (KNN, k={})...".format(config.impute_neighbors))
     responses = _impute_response_frame(responses_raw, config.impute_neighbors)
     # Prefer declared min/max from scales; fall back to observed ranges per item.
     declared_ranges = None
@@ -429,6 +435,7 @@ def analyze_survey_table(
         emb_requested_backend = basis.embedding_backend
         emb_requested_model = basis.embedding_model
         basis_source = "precomputed"
+        log("using precomputed basis ({} PCs)".format(n_components))
     else:
         if item_embeddings is not None:
             embedding_vectors = item_embeddings.matrix_for(item_columns)
@@ -439,6 +446,7 @@ def analyze_survey_table(
             emb_requested_model = item_embeddings.model_name
             basis_source = "computed_from_embeddings"
         else:
+            log("embedding {} items (loading model)...".format(len(item_columns)))
             embedding_result = embed_texts_with_metadata(
                 item_texts,
                 method=config.embedding,
@@ -452,6 +460,8 @@ def analyze_survey_table(
             emb_requested_model = embedding_result.requested_model_name
             basis_source = "computed_inline"
 
+        log("building PCA basis (parallel analysis, {} permutations)...".format(
+            config.d_null_permutations))
         computed_basis = build_semantic_basis(
             items=item_columns,
             embedding_vectors=embedding_vectors,
@@ -478,6 +488,7 @@ def analyze_survey_table(
 
     covariate_names = list(config.covariates) if config.covariates is not None else default_covariates(metadata)
     covariates, kept_covariates = build_covariate_matrix(metadata, covariate_names)
+    log("stability sweep over {} components (Mahalanobis per D)...".format(n_components))
     stability = _stability_frame(
         response_norm=response_norm,
         item_coordinates_full=item_coordinates_full,
@@ -486,6 +497,7 @@ def analyze_survey_table(
         n_components=n_components,
         explained_variance=explained,
         weights=weights,
+        progress=log,
     )
     d_stability, stability_reached = stability_dimension(
         stability=stability,
@@ -501,11 +513,14 @@ def analyze_survey_table(
         n_components=n_components,
     )
 
+    log("selected D={} ({} rule); projecting + residualizing".format(
+        optimal_d, normalize_d_selection_method(config.d_selection_method)))
     item_coordinates = item_coordinates_full[:, :optimal_d]
     semantic_scores = np.dot(response_norm, item_coordinates)
     residual_scores = residualize(semantic_scores, covariates, weights=weights)
 
     if config.compute_umap:
+        log("computing UMAP (2 fits: raw + semantic)...")
         raw_response_umap = umap_embedding_frame(
             features=response_norm,
             metadata=metadata,
@@ -526,6 +541,7 @@ def analyze_survey_table(
         raw_response_umap = pd.DataFrame()
         semantic_pc_umap = pd.DataFrame()
 
+    log("Mahalanobis distances + outlier flags...")
     distances = mahalanobis_distances(residual_scores, weights=weights)
     scores = _score_frame(
         table=table,
@@ -984,11 +1000,15 @@ def _stability_frame(
     n_components: int,
     explained_variance: np.ndarray,
     weights: Optional[np.ndarray] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
     records = []
     previous = set()
     cumulative = np.cumsum(explained_variance)
+    step = max(1, n_components // 10)
     for dim in range(1, n_components + 1):
+        if progress is not None and (dim % step == 0 or dim == n_components):
+            progress("  stability {}/{}".format(dim, n_components))
         scores = np.dot(response_norm, item_coordinates_full[:, :dim])
         residual = residualize(scores, covariates, weights=weights)
         distances = mahalanobis_distances(residual, weights=weights)

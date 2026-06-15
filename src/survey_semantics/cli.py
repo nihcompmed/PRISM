@@ -2,8 +2,9 @@
 
 import argparse
 import re
+import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import pandas as pd
 
@@ -185,6 +186,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Empirical Mahalanobis percentiles for outlier/pan-mild flagging (default: 95 99).",
     )
     parser.add_argument("--skip-umap", action="store_true", help="Do not generate raw/semantic UMAP coordinate files.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress the per-stage progress messages (printed to stderr by default).")
     parser.add_argument("--umap-neighbors", type=int, default=15)
     parser.add_argument("--umap-min-dist", type=float, default=0.10)
     parser.add_argument("--umap-metric", default="euclidean")
@@ -347,6 +349,17 @@ def _filter_prompts_by_embed(prompts: dict, scales: dict) -> dict:
     return kept
 
 
+def _progress_reporter(args: argparse.Namespace) -> Optional[Callable[[str], None]]:
+    """Per-stage progress callback printing to stderr, unless --quiet is set."""
+    if getattr(args, "quiet", False):
+        return None
+
+    def report(message: str) -> None:
+        print("[survey-semantics] {}".format(message), file=sys.stderr, flush=True)
+
+    return report
+
+
 def _analyze_file(args: argparse.Namespace) -> int:
     if not (args.scale_file or args.scale_dir):
         raise SystemExit(
@@ -375,6 +388,7 @@ def _analyze_file(args: argparse.Namespace) -> int:
         item_embeddings = load_item_embeddings(args.embeddings_file)
     result = analyze_survey_table(
         table, _config_from_args(args), item_embeddings=item_embeddings, basis=basis,
+        progress=_progress_reporter(args),
     )
     _write_result(result, args.outdir, _safe_name(result.table_name))
     _write_summary(pd.DataFrame([result.summary]), args.outdir, result.summary["embedding_slug"])
@@ -407,7 +421,7 @@ def _analyze_package(args: argparse.Namespace) -> int:
 
         try:
             table = read_survey_table(path, prompt_dictionary=prompts)
-            result = analyze_survey_table(table, config)
+            result = analyze_survey_table(table, config, progress=_progress_reporter(args))
         except Exception as exc:
             reason = str(exc)
             summaries.append({"table": path.stem, "path": str(path), "status": "skipped", "reason": reason})
@@ -459,7 +473,10 @@ def _analyze_package_combined(args: argparse.Namespace) -> int:
         auto_reverse_min_pairwise_fraction=args.auto_reverse_min_pairwise_fraction,
     )
     config.reverse_items = combined.reverse_items
-    result = analyze_survey_table(combined.table, config, item_columns=combined.item_columns)
+    result = analyze_survey_table(
+        combined.table, config, item_columns=combined.item_columns,
+        progress=_progress_reporter(args),
+    )
     _write_result(result, args.outdir, _safe_name(result.table_name))
     _write_summary(pd.DataFrame([result.summary]), args.outdir, result.summary["embedding_slug"])
     combined.prompt_inventory.to_csv(args.outdir / "combined_prompt_inventory.csv", index=False)
